@@ -1,0 +1,9 @@
+.env
+downloads/
+playwright/.auth/
+auth-state.json
+*.log
+node_modules/
+dist/
+coverage/
+*.tmp
