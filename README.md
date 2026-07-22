@@ -1,6 +1,6 @@
 # Utility Bill Downloader
 
-A TypeScript/Playwright command-line application that signs in to a utility portal, finds bills whose billing cycles overlap an inclusive calendar-date range, downloads them in batches, validates every PDF, and merges the batches into one PDF.
+A TypeScript/Playwright command-line application that signs in to a utility portal, finds bills whose billing-cycle start dates fall within an inclusive calendar-date range, selects all matches, downloads each bill individually, validates every PDF, and merges them into one PDF.
 
 Duke Energy is the first portal adapter. The batching, manifest, PDF, retry, logging, output-path, and CLI code is portal-independent so another adapter can be added without duplicating that workflow.
 
@@ -55,17 +55,17 @@ DUKE_PASSWORD=your-duke-password
 
 Credentials are checked before Playwright opens a browser. Missing values produce a clear error. `.env` is ignored by Git, and the application redacts configured credentials and common cookie, authorization, session, and token values from errors. Do not commit `.env`, downloaded bills, authentication state, or logs.
 
-The optional URL overrides are described in [Live Duke configuration](#live-duke-configuration).
+The optional home, login, and business billing-history URL overrides are described in [Live Duke configuration](#live-duke-configuration).
 
 ## Run the downloader
 
-Show the CLI help:
+Show the CLI help (invoke `tsx` directly because npm may consume `--help`):
 
 ```powershell
-npm run download -- --help
+npx tsx src/index.ts --help
 ```
 
-`--portal`, `--start-date`, and `--end-date` are required. `--output-dir` defaults to `./downloads`. Arguments and dates are validated before the browser opens.
+`--portal`, `--start-date`, and `--end-date` are required. `--output-dir` defaults to `./downloads`. Arguments and dates are validated before the browser opens. Duke runs every Business Partner in the top-right selector by default; add `--current-account-only` to process only the account active at startup.
 
 ### Headed mode (default)
 
@@ -79,7 +79,13 @@ npm run download -- `
   --output-dir .\downloads
 ```
 
-The `--` after `npm run download` passes the remaining options to the application.
+On some npm 10 + PowerShell installations, npm strips the option names and
+passes only their values to the script. This application accepts that exact
+shape as a compatibility fallback. The direct form is also available:
+
+```powershell
+npx tsx src/index.ts --portal duke --start-date 2025-06-01 --end-date 2025-06-30 --output-dir .\downloads
+```
 
 ### Headless mode
 
@@ -94,12 +100,46 @@ npm run download -- `
   --headless
 ```
 
+### Download June-starting bills for mapped buildings
+
+To save one Duke bill per account from a CSV, use an account map with `Account
+Number` and `Building Name` columns. This command accepts only billing cycles
+that start in June 2026; their ending date is deliberately ignored. Other
+columns may be duplicated or vary between rows; they are ignored. Building
+names may contain commas when properly quoted.
+
+```powershell
+npm.cmd run download -- `
+  --portal duke `
+  --account-map '.\Duke Meters LLM data.csv' `
+  --billing-start-month 2026-06
+```
+
+This creates `downloads\named-building-bills` and writes one PDF named for each
+building. If a building name would produce the same Windows filename as another
+one, the account number is appended to both filenames. `targeted-run.json` in
+that folder records downloaded, reused, unmatched, and failed accounts. An
+unmatched account does not stop the other downloads. On a later run, an existing
+valid PDF is reused only when it is for the same Duke billing cycle.
+
+Targeted Duke scans request 25 billing-history rows per page when the live portal
+offers that page-size control. Each matching account is downloaded and validated
+as soon as its current Business Partner scan finds it, before the scan moves on
+to later pages or partners.
+
+The targeted-run log explains each decision: page ranges, real parsed-row counts,
+rows in the requested month, target-account matches, remaining targets, download
+start/completion, and partner-scan completion.
+
+Use `--output-dir <folder>` with the command above to choose another destination,
+or `--current-account-only` to limit the search to the active Business Partner.
+
 ### Date-range behavior
 
-Dates must be real calendar dates in `YYYY-MM-DD` format, and the start date cannot be later than the end date. Matching is inclusive and is based on billing-cycle overlap, not just the bill's due date:
+Dates must be real calendar dates in `YYYY-MM-DD` format, and the start date cannot be later than the end date. Bill matching uses only the billing-cycle start date, with both boundaries inclusive.
 
 ```text
-billStart <= requestedEnd && billEnd >= requestedStart
+billingCycleStart >= requestedStart && billingCycleStart <= requestedEnd
 ```
 
 Calendar dates are represented at UTC midnight internally so a local timezone cannot shift a date by one day. A cycle such as `05/15/2025 - 06/15/2025` therefore matches a request beginning on `2025-06-01`.
@@ -118,19 +158,21 @@ produces:
 D:\UtilityBills\
   duke\
     2025-06-01-to-2025-06-30\
-      batch-001.pdf
-      batch-002.pdf
-      combined-bills-2025-06-01-to-2025-06-30.pdf
-      manifest.json
+      run-summary.json
+      accounts\
+        account-1102669801\
+          batch-001.pdf
+          combined-bills-2025-06-01-to-2025-06-30.pdf
+          manifest.json
 ```
 
-The batch PDFs are retained after the combined PDF is created. If no bills match, the run exits successfully, writes a completed zero-bill manifest, and does not download or merge PDFs.
+The batch PDFs are retained after the combined PDF is created. Each discovered Business Partner receives its own folder and manifest before account activation begins; `run-summary.json` records completed and failed accounts. A per-account manifest reports `accountStatus` as `completed`, `pending`, or `failed`, so a completed zero-bill scan is distinguishable from an account that could not be scanned.
 
 ## How a run works
 
 ### Scan and duplicate prevention
 
-The Duke adapter first returns to the first billing-table page and scans every page before downloading anything. It maps columns from normalized header text instead of assuming a fixed column order. Account number, service address, billing cycle, and a row selection checkbox are required; due date and amount due are recorded when present.
+The Duke adapter discovers every Business Partner in the scrollable selector, activates one at a time, then returns to the first billing-table page and scans all available table pages (up to the 500-page safety guard). It selects bills whose billing-cycle start date is within the requested start/end dates, inclusively; the billing-cycle end date does not affect matching. An unreadable row is logged and skipped so it does not prevent later bills from being processed. It maps columns from normalized header text instead of assuming a fixed column order. Account number, service address, billing cycle, and a row selection checkbox are required; due date and amount due are recorded when present.
 
 Each bill is tracked with this unique key:
 
@@ -138,26 +180,27 @@ Each bill is tracked with this unique key:
 accountNumber|billingCycleStart|billingCycleEnd
 ```
 
-Billing-cycle dates in the key use `YYYY-MM-DD`. Repeated table rows with the same key are ignored during scanning.
+Billing-cycle dates in the key use `YYYY-MM-DD`. Duke cycles may appear as `June 10, 2026 - July 09, 2026`; repeated table rows with the same key are ignored during scanning.
 
 Pagination waits for the table rows to change and for the replacement rows to be ready. Page fingerprints include the page indicator and prevent loops; traversal stops with an error rather than exceeding 500 pages.
 
-### Batching and persistent selections
+### Selection and individual downloads
 
-Matching bills are split into ordered batches of at most 25: 33 bills become batches of 25 and 8, for example. The application never sends more than 25 bills to Duke's Print Bills action.
+Matching bills are split into selection batches of at most 25 because Duke does not allow more than 25 selected bills at once. The terminal prints each bill's account number, service address, and billing cycle as it is selected.
 
-For each batch, the Duke adapter:
+The Duke adapter:
 
 1. Clears stale selections and verifies a selected count of zero.
-2. Returns to the first table page and traverses all pages.
+2. Returns to the first table page and traverses every available page, up to the 500-page safety guard.
 3. Selects only rows whose account number and billing-cycle dates match a target key.
 4. Leaves earlier selections checked while moving to later pages, because Duke is expected to preserve selection state across pagination.
 5. Requires every target key to occur exactly once and rejects any selected non-target row.
-6. Verifies Duke's displayed selected-account count equals the batch size.
-7. Downloads and validates the batch PDF.
-8. Clears selections with Duke's global control, or unchecks selected rows across every page as a fallback, then verifies the selected count is zero before continuing.
+6. Verifies Duke's displayed selected-account count equals the current batch size.
+7. Downloads each selected bill PDF link one at a time.
+8. Merges and validates that batch's individual bill PDFs.
+9. Clears selections with Duke's global control, or unchecks selected rows across every page as a fallback, then verifies the selected count is zero before selecting the next batch.
 
-A failed batch gets an initial attempt plus up to three retries, after backoffs of 2, 5, and 10 seconds. Each retry clears selections, returns to the first page, selects the batch again, and rechecks the count.
+A failed batch gets an initial attempt plus up to three retries, after backoffs of 2, 5, and 10 seconds. Each retry clears selections, returns to the first page, selects that batch again, and rechecks the count. After all batches complete, their PDFs are merged into the final combined PDF.
 
 ### PDF capture and validation
 
@@ -215,13 +258,13 @@ The following defaults in `src/portals/duke/config.ts` require verification agai
 | Purpose | Default | Override |
 | --- | --- | --- |
 | Login | `https://my.duke-energy.com/login` | `DUKE_LOGIN_URL` |
-| Billing history | `https://my.duke-energy.com/my-account/billing-payments/billing-history` | `DUKE_BILLS_URL` |
+| Business billing history | `https://businessportal2.duke-energy.com/billinghistory` | `DUKE_BUSINESS_BILLS_URL` |
 
 Override either route in `.env` without changing source:
 
 ```dotenv
 DUKE_LOGIN_URL=https://verified-login-route.example
-DUKE_BILLS_URL=https://verified-billing-history-route.example
+DUKE_BUSINESS_BILLS_URL=https://verified-business-billing-history-route.example
 ```
 
 Use only trusted Duke URLs. URL values can contain credentials or session data in some systems, so do not place temporary authenticated links in `.env` or commit them.
@@ -307,7 +350,7 @@ For a Blue Ridge adapter, for example:
 1. Create `src/portals/blue-ridge/BlueRidgePortal.ts`, `config.ts`, and `selectors.ts`, plus a portal-specific download helper if its PDF flow needs one.
 2. Implement every method in `src/types/BillingPortal.ts`: `login`, `navigateToBills`, `scanBills`, `selectBatch`, `downloadSelectedBatch`, `clearSelections`, and `verifySelectionCount`. Set `name` to the exact CLI portal name.
 3. Keep its URLs, selectors, login rules, table/pagination rules, selection behavior, and download behavior inside that folder. Return shared `Bill` objects and build keys with `createBillUniqueKey`.
-4. Make `scanBills` traverse all of that portal's pages, deduplicate rows, and apply the requested overlap dates. Never return another portal's name in a bill.
+4. Make `scanBills` traverse all of that portal's pages, deduplicate rows, and apply the requested billing-cycle start-date range. Never return another portal's name in a bill.
 5. Add the new name to `SUPPORTED_PORTALS` in `src/utils/arguments.ts`, then import and construct the adapter in the switch in `src/index.ts`. Validate that portal's credentials before calling `runPortal`.
 6. Document its environment variables in `.env.example` and add unit tests for any portal-specific parsing or mapping logic. Live-site tests should remain separate from the unit suite.
 7. Run the checks below, then validate a small headed download with an authorized test account.

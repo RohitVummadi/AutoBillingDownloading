@@ -13,6 +13,10 @@ export function normalizeBillField(value: string): string {
   return value.replace(/\s+/gu, ' ').trim();
 }
 
+export function normalizeAccountNumber(value: string): string {
+  return value.replace(/\D/gu, '');
+}
+
 export function createBillUniqueKey(
   accountNumber: string,
   billingCycleStart: string,

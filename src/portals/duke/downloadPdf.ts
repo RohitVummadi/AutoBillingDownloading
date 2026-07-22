@@ -2,6 +2,7 @@ import type {
   APIResponse,
   BrowserContext,
   Download,
+  Frame,
   Locator,
   Page,
   Response,
@@ -17,6 +18,23 @@ export interface DukeDownloadOptions {
   outputPath: string;
   timeoutMs: number;
   responseUrlHints: readonly string[];
+  onCapture?: (source: 'download' | 'popup' | 'response' | 'iframe') => void;
+}
+
+/**
+ * Thrown when Duke returned a response/download that looked like a bill PDF but
+ * was actually an HTML login, error, or access-denied page. This almost always
+ * means the authenticated session was invalidated (expired or rate-limited)
+ * mid-run, so the caller should re-authenticate and retry rather than give up.
+ */
+export class DukeSessionExpiredError extends Error {
+  public constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = 'DukeSessionExpiredError';
+    if (cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = cause;
+    }
+  }
 }
 
 export async function downloadDukePdf(options: DukeDownloadOptions): Promise<string> {
@@ -24,6 +42,7 @@ export async function downloadDukePdf(options: DukeDownloadOptions): Promise<str
   let printStarted = false;
   let timeoutHandle: NodeJS.Timeout | undefined;
   const candidateFailures: string[] = [];
+  let sessionExpiredError: DukeSessionExpiredError | undefined;
 
   let resolveResult: (contents: Buffer) => void = () => undefined;
   let rejectResult: (error: Error) => void = () => undefined;
@@ -38,6 +57,7 @@ export async function downloadDukePdf(options: DukeDownloadOptions): Promise<str
   const cleanup = (): void => {
     options.page.off('download', downloadHandler);
     options.page.off('popup', popupHandler);
+    options.page.off('framenavigated', frameHandler);
     options.context.off('response', responseHandler);
     if (timeoutHandle) {
       clearTimeout(timeoutHandle);
@@ -45,7 +65,7 @@ export async function downloadDukePdf(options: DukeDownloadOptions): Promise<str
   };
 
   const considerCandidate = async (
-    source: string,
+    source: 'download' | 'popup' | 'response' | 'iframe',
     producer: () => Promise<Buffer>,
   ): Promise<void> => {
     if (settled) return;
@@ -53,20 +73,40 @@ export async function downloadDukePdf(options: DukeDownloadOptions): Promise<str
       const contents = await producer();
       const validation = validatePdfBuffer(contents);
       if (!validation.valid) {
+        // When Duke returns an HTML login/error page instead of a PDF, the
+        // authenticated session has almost certainly been invalidated. Surface
+        // a typed error so the caller can re-authenticate and retry instead of
+        // burning the remaining attempts on a dead session.
+        if (validation.message.includes('HTML')) {
+          throw new DukeSessionExpiredError(
+            `Duke returned an HTML page (${validation.message}) instead of a PDF from the ${source} source; the session is likely expired.`,
+          );
+        }
         throw new Error(validation.message);
       }
       if (!settled) {
         settled = true;
         cleanup();
+        options.onCapture?.(source);
         resolveResult(contents);
       }
-    } catch {
+    } catch (error) {
       candidateFailures.push(source);
+      // Re-throw a session-expiry signal so it is not swallowed by the
+      // per-candidate catch above; the timeout handler will surface it.
+      if (error instanceof DukeSessionExpiredError) {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          sessionExpiredError = error;
+          rejectResult(error);
+        }
+      }
     }
   };
 
   function downloadHandler(download: Download): void {
-    void considerCandidate('browser download', async () => {
+    void considerCandidate('download', async () => {
       const failure = await download.failure();
       if (failure) {
         throw new Error('Browser download failed.');
@@ -85,7 +125,7 @@ export async function downloadDukePdf(options: DukeDownloadOptions): Promise<str
 
   function responseHandler(response: Response): void {
     if (!printStarted || !isPdfResponse(response, options.responseUrlHints)) return;
-    void considerCandidate('PDF network response', async () => {
+    void considerCandidate('response', async () => {
       const responsePage = response.frame().page();
       if (responsePage !== options.page && (await responsePage.opener()) !== options.page) {
         throw new Error('PDF response was not initiated by the Duke billing page.');
@@ -95,7 +135,7 @@ export async function downloadDukePdf(options: DukeDownloadOptions): Promise<str
   }
 
   function popupHandler(popup: Page): void {
-    void considerCandidate('PDF popup', async () => {
+    void considerCandidate('popup', async () => {
       try {
         return await readPopupPdf(popup, options.context, options.timeoutMs);
       } finally {
@@ -104,13 +144,23 @@ export async function downloadDukePdf(options: DukeDownloadOptions): Promise<str
     });
   }
 
+  function frameHandler(frame: Frame): void {
+    if (!printStarted || frame === options.page.mainFrame()) return;
+    void considerCandidate('iframe', async () => readFramePdf(frame, options.context, options.timeoutMs));
+  }
+
   options.page.on('download', downloadHandler);
   options.page.on('popup', popupHandler);
+  options.page.on('framenavigated', frameHandler);
   options.context.on('response', responseHandler);
   timeoutHandle = setTimeout(() => {
     if (!settled) {
       settled = true;
       cleanup();
+      if (sessionExpiredError) {
+        rejectResult(sessionExpiredError);
+        return;
+      }
       const suffix =
         candidateFailures.length > 0
           ? ` Invalid candidates observed from: ${[...new Set(candidateFailures)].join(', ')}.`
@@ -131,6 +181,11 @@ export async function downloadDukePdf(options: DukeDownloadOptions): Promise<str
     if (!settled) {
       settled = true;
       cleanup();
+    }
+    // A session-expiry signal should propagate unchanged so the caller can
+    // re-authenticate instead of treating it as an ordinary download failure.
+    if (error instanceof DukeSessionExpiredError) {
+      throw error;
     }
     throw error;
   } finally {
@@ -191,6 +246,40 @@ async function readPopupPdf(
   }
   const response = await context.request.get(candidateUrl, { timeout: timeoutMs });
   return bodyFromApiResponse(response);
+}
+
+async function readFramePdf(
+  frame: Frame,
+  context: BrowserContext,
+  timeoutMs: number,
+): Promise<Buffer> {
+  const url = frame.url();
+  if (url.startsWith('blob:')) {
+    const base64 = await frame.evaluate(async () => {
+      const response = await fetch(window.location.href, { credentials: 'include' });
+      if (!response.ok) throw new Error('Iframe blob PDF request failed.');
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      const chunkSize = 32_768;
+      let binary = '';
+      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+      }
+      return btoa(binary);
+    });
+    return Buffer.from(base64, 'base64');
+  }
+  if (url.startsWith('data:application/pdf')) {
+    const commaIndex = url.indexOf(',');
+    if (commaIndex < 0) throw new Error('Malformed iframe PDF data URL.');
+    const metadata = url.slice(0, commaIndex);
+    const payload = url.slice(commaIndex + 1);
+    return metadata.includes(';base64')
+      ? Buffer.from(payload, 'base64')
+      : Buffer.from(decodeURIComponent(payload), 'latin1');
+  }
+  const candidateUrl = extractHttpPdfUrl(url);
+  if (!candidateUrl) throw new Error('Iframe did not expose an authenticated PDF URL.');
+  return bodyFromApiResponse(await context.request.get(candidateUrl, { timeout: timeoutMs }));
 }
 
 function extractHttpPdfUrl(value: string): string | null {

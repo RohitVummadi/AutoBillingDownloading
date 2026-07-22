@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import {
   compareCalendarDates,
-  dateRangesOverlap,
   formatCalendarDate,
+  isBillingCycleStartInRange,
   parseBillingCycle,
   parseIsoDate,
 } from '../src/utils/dates.js';
@@ -18,6 +18,16 @@ describe('billing-cycle dates', () => {
   it('accepts a Unicode dash and flexible whitespace', () => {
     const cycle = parseBillingCycle(' 6/6/2025  –  7/8/2025 ');
     expect([cycle.startIso, cycle.endIso]).toEqual(['2025-06-06', '2025-07-08']);
+  });
+
+  it('parses Duke month-name billing cycles', () => {
+    const cycle = parseBillingCycle('June 10, 2026 - July 09, 2026');
+    expect([cycle.startIso, cycle.endIso]).toEqual(['2026-06-10', '2026-07-09']);
+  });
+
+  it('ignores trailing Duke bill labels after a date', () => {
+    const cycle = parseBillingCycle('July 01, 2025 - Aug 12, 2025 Corrected Bill');
+    expect([cycle.startIso, cycle.endIso]).toEqual(['2025-07-01', '2025-08-12']);
   });
 
   it.each([
@@ -36,23 +46,22 @@ describe('billing-cycle dates', () => {
 });
 
 describe('calendar comparisons', () => {
-  it('uses inclusive overlap boundaries', () => {
+  it.each([
+    ['May 21, 2026 - June 19, 2026', false],
+    ['May 28, 2026 - June 26, 2026', false],
+    ['May 29, 2026 - June 29, 2026', false],
+    ['June 01, 2026 - June 30, 2026', true],
+    ['June 10, 2026 - July 10, 2026', true],
+    ['July 12, 2026 - August 12, 2026', true],
+    ['July 13, 2026 - August 13, 2026', false],
+  ])('filters by billing-cycle start date for %s', (cycleText, expected) => {
     expect(
-      dateRangesOverlap(
-        parseIsoDate('2025-05-01'),
-        parseIsoDate('2025-06-01'),
-        parseIsoDate('2025-06-01'),
-        parseIsoDate('2025-06-30'),
+      isBillingCycleStartInRange(
+        parseBillingCycle(cycleText).start,
+        parseIsoDate('2026-06-01'),
+        parseIsoDate('2026-07-12'),
       ),
-    ).toBe(true);
-    expect(
-      dateRangesOverlap(
-        parseIsoDate('2025-04-01'),
-        parseIsoDate('2025-05-31'),
-        parseIsoDate('2025-06-01'),
-        parseIsoDate('2025-06-30'),
-      ),
-    ).toBe(false);
+    ).toBe(expected);
   });
 
   it('does not shift a calendar date through the local timezone', () => {

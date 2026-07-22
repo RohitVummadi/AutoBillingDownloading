@@ -1,17 +1,30 @@
 import { chromium } from 'playwright';
-import type { BrowserContext, Page } from 'playwright';
+import type { Browser, BrowserContext, Page } from 'playwright';
 
 import { mergePdfs } from '../pdf/mergePdfs.js';
 import { assertValidPdf, validatePdf } from '../pdf/validatePdf.js';
 import type { Bill } from '../types/Bill.js';
 import { createBillUniqueKey, deduplicateBills } from '../types/Bill.js';
 import type { BillingPortal } from '../types/BillingPortal.js';
-import type { BatchManifestRecord, Manifest } from '../types/Manifest.js';
-import { createOutputPaths, ensureDirectory } from '../utils/files.js';
+import type {
+  AccountRunSummary,
+  BatchManifestRecord,
+  FinalRunManifest,
+  Manifest,
+  RunSummary,
+} from '../types/Manifest.js';
+import type { PortalAccount } from '../types/PortalAccount.js';
+import {
+  createAccountOutputPaths,
+  createRunOutputPaths,
+  ensureDirectory,
+  writeJsonAtomically,
+} from '../utils/files.js';
 import type { Logger } from '../utils/logging.js';
-import { contextualError, errorMessage } from '../utils/logging.js';
-import { retry } from '../utils/retry.js';
+import { contextualError, errorMessage, redactSensitiveText } from '../utils/logging.js';
+import { BATCH_RETRY_DELAYS_MS, retry } from '../utils/retry.js';
 import { compareCalendarDates, parseIsoDate } from '../utils/dates.js';
+import { isBillingCycleStartInRange } from '../utils/dates.js';
 import { batchBills } from './batchBills.js';
 import {
   createManifest,
@@ -34,6 +47,7 @@ export interface RunPortalOptions {
   endDateText: string;
   outputRoot: string;
   headless: boolean;
+  currentAccountOnly: boolean;
   logger: Logger;
   createPortal(context: PortalFactoryContext): BillingPortal;
   now?: () => Date;
@@ -42,24 +56,27 @@ export interface RunPortalOptions {
 export interface RunPortalResult {
   totalMatchingBills: number;
   totalBatches: number;
-  manifestPath: string;
-  combinedPdfPath: string | null;
+  runSummaryPath: string;
+  accounts: AccountRunSummary[];
+  hadFailures: boolean;
 }
 
 export async function runPortal(options: RunPortalOptions): Promise<RunPortalResult> {
   const now = options.now ?? (() => new Date());
-  let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+  let browser: Browser | undefined;
   let context: BrowserContext | undefined;
+  let failed = false;
 
   options.logger.info(`Starting portal: ${options.portalName}`);
   try {
-    const paths = createOutputPaths(
+    const runPaths = createRunOutputPaths(
       options.outputRoot,
       options.portalName,
       options.startDateText,
       options.endDateText,
     );
-    await ensureDirectory(paths.runDirectory);
+    await ensureDirectory(runPaths.runDirectory);
+    options.logger.info(`Downloaded files will be saved to: ${runPaths.runDirectory}`);
 
     browser = await chromium.launch({ headless: options.headless });
     context = await browser.newContext({ acceptDownloads: true });
@@ -73,207 +90,433 @@ export async function runPortal(options: RunPortalOptions): Promise<RunPortalRes
 
     await portal.login();
     await portal.navigateToBills();
-    const scannedBills = await portal.scanBills(options.startDate, options.endDate);
-    const matchingBills = validateAndDeduplicateBills(scannedBills, options.portalName);
-    options.logger.info(`Found ${matchingBills.length} matching bills`);
-
-    const batches = batchBills(matchingBills);
-    options.logger.info(`Created ${batches.length} batches`);
-
-    const previousManifest = await readManifest(paths.manifestPath);
-    const compatiblePrevious =
-      previousManifest &&
-      isManifestForRun(
-        previousManifest,
-        options.portalName,
-        options.startDateText,
-        options.endDateText,
-      )
-        ? previousManifest
-        : null;
-    const manifest = createManifest({
+    const discoveredAccounts = await portal.listAccounts();
+    const initialCurrentAccount = discoveredAccounts.find((account) => account.isCurrent);
+    const accounts = options.currentAccountOnly
+      ? discoveredAccounts.filter((account) => account.isCurrent)
+      : initialCurrentAccount
+        ? [
+            initialCurrentAccount,
+            ...discoveredAccounts.filter((account) => account.id !== initialCurrentAccount.id),
+          ]
+        : discoveredAccounts;
+    if (accounts.length === 0) {
+      throw new Error('No current Business Partner account was identified.');
+    }
+    const summary: RunSummary = {
       portal: options.portalName,
       requestedStartDate: options.startDateText,
       requestedEndDate: options.endDateText,
-      batches,
-      batchPdfName: paths.batchPdfName,
-      startedAt: compatiblePrevious?.downloadStartTimestamp ?? now().toISOString(),
-    });
-    if (compatiblePrevious) {
-      manifest.batches = compatiblePrevious.batches.filter((record) => {
-        const expectedBatch = batches[record.batchNumber - 1];
-        return (
-          expectedBatch !== undefined &&
-          record.numberOfBills === expectedBatch.length &&
-          record.batchPdfPath === paths.batchPdfName(record.batchNumber) &&
-          record.includedBillUniqueKeys.join('\n') ===
-            expectedBatch.map((bill) => bill.uniqueKey).join('\n')
-        );
-      });
-    }
-    await writeManifest(paths.manifestPath, manifest);
-
-    if (matchingBills.length === 0) {
-      manifest.downloadCompletionTimestamp = now().toISOString();
-      await writeManifest(paths.manifestPath, manifest);
-      options.logger.info('No matching bills found; no downloads were attempted.');
-      return {
+      startedAt: now().toISOString(),
+      completedAt: null,
+      accounts: accounts.map((account) => ({
+        account,
+        status: 'pending',
         totalMatchingBills: 0,
         totalBatches: 0,
-        manifestPath: paths.manifestPath,
+        manifestPath: null,
         combinedPdfPath: null,
-      };
-    }
-
-    for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-      const batch = batches[batchIndex];
-      if (!batch) throw new Error(`Internal error: batch ${batchIndex + 1} is missing.`);
-      const batchNumber = batchIndex + 1;
-      const batchPath = paths.batchPdfPath(batchNumber);
-      const batchName = paths.batchPdfName(batchNumber);
-      const expectedKeys = batch.map((bill) => bill.uniqueKey);
-      const previousRecord = findReusableBatchRecord(
-        compatiblePrevious,
-        batchNumber,
-        expectedKeys,
-        batchName,
-      );
-      const existingValidation = previousRecord ? await validatePdf(batchPath) : null;
-
-      let record: BatchManifestRecord;
-      if (previousRecord && existingValidation?.valid) {
-        record = { ...previousRecord, validationResult: existingValidation };
-        options.logger.info(`Validated existing ${batchName}; skipping download`);
-      } else {
-        record = await retry(
-          async () => {
-            await portal.clearSelections();
-            await portal.verifySelectionCount(0);
-
-            options.logger.info(
-              `Selecting batch ${batchNumber} of ${batches.length}`,
-            );
-            await portal.selectBatch(batch);
-            await portal.verifySelectionCount(batch.length);
-            options.logger.info(`Selected ${batch.length} of ${batch.length} bills`);
-
-            options.logger.info(
-              `Downloading batch ${batchNumber} of ${batches.length}`,
-            );
-            const downloadedPath = await portal.downloadSelectedBatch(batchNumber, batchPath);
-            if (downloadedPath !== batchPath) {
-              throw contextualError(
-                'download batch',
-                'Portal adapter saved the PDF to an unexpected path.',
-                { portal: options.portalName, batch: batchNumber },
-              );
-            }
-            const validationResult = await assertValidPdf(batchPath);
-            options.logger.info(`Validated ${batchName}`);
-
-            return {
-              batchNumber,
-              numberOfBills: batch.length,
-              batchPdfPath: batchName,
-              downloadTimestamp: now().toISOString(),
-              validationResult,
-              includedBillUniqueKeys: expectedKeys,
-            };
-          },
-          {
-            onRetry: ({ nextAttempt, delayMs, error }) => {
-              options.logger.warn(
-                `[portal=${options.portalName} batch=${batchNumber}] batch attempt failed: ${errorMessage(error)}. Retrying with attempt ${nextAttempt} after ${delayMs / 1_000} seconds.`,
-              );
-            },
-          },
-        ).catch(async (error: unknown) => {
-          const fileValidation = await validatePdf(batchPath);
-          const failedRecord: BatchManifestRecord = {
-            batchNumber,
-            numberOfBills: batch.length,
-            batchPdfPath: batchName,
-            downloadTimestamp: now().toISOString(),
-            validationResult: {
-              valid: false,
-              sizeBytes: fileValidation.sizeBytes,
-              message: fileValidation.valid
-                ? 'Batch processing failed before a successful checkpoint was recorded.'
-                : fileValidation.message,
-            },
-            includedBillUniqueKeys: expectedKeys,
-          };
-          upsertBatchRecord(manifest, failedRecord);
-          await writeManifest(paths.manifestPath, manifest);
-          throw contextualError(
-            'process batch',
-            errorMessage(error),
-            { portal: options.portalName, batch: batchNumber },
-            error,
-          );
-        });
-
-      }
-
-      upsertBatchRecord(manifest, record);
-      await writeManifest(paths.manifestPath, manifest);
-
-      try {
-        await portal.clearSelections();
-        await portal.verifySelectionCount(0);
-      } catch (error) {
-        throw contextualError(
-          'clear selections after successful batch',
-          errorMessage(error),
-          { portal: options.portalName, batch: batchNumber },
-          error,
-        );
-      }
-      options.logger.info('Cleared all selections');
-    }
-
-    const orderedBatchPaths = batches.map((_, index) => paths.batchPdfPath(index + 1));
-    options.logger.info(`Merging ${orderedBatchPaths.length} PDFs`);
-    await mergePdfs(orderedBatchPaths, paths.combinedPdfPath);
-    await assertValidPdf(paths.combinedPdfPath);
-
-    manifest.finalMergedPdfPath = paths.combinedPdfName;
-    manifest.downloadCompletionTimestamp = now().toISOString();
-    await writeManifest(paths.manifestPath, manifest);
-    options.logger.info(`Finished: ${paths.combinedPdfPath}`);
-
-    return {
-      totalMatchingBills: matchingBills.length,
-      totalBatches: batches.length,
-      manifestPath: paths.manifestPath,
-      combinedPdfPath: paths.combinedPdfPath,
+        failureMessage: null,
+      })),
     };
+    await writeJsonAtomically(runPaths.runSummaryPath, summary);
+
+    let activeAccountId = initialCurrentAccount?.id;
+    const uniqueBills = new Map<string, Bill>();
+    const billSourcePartners = new Map<string, Set<string>>();
+    for (let index = 0; index < accounts.length; index += 1) {
+      const account = accounts[index]!;
+      const record = summary.accounts[index]!;
+      options.logger.info(`Processing Business Partner ${index + 1}/${accounts.length}: ${account.id} ${account.label}`);
+      try {
+        const accountPaths = createAccountOutputPaths(
+          options.outputRoot,
+          options.portalName,
+          options.startDateText,
+          options.endDateText,
+          account.id,
+        );
+        record.manifestPath = accountPaths.manifestPath;
+        await ensureDirectory(accountPaths.runDirectory);
+        if ((await readManifest(accountPaths.manifestPath)) === null) {
+          await writeManifest(
+            accountPaths.manifestPath,
+            createManifest({
+              portal: options.portalName,
+              account,
+              requestedStartDate: options.startDateText,
+              requestedEndDate: options.endDateText,
+              batches: [],
+              batchPdfName: accountPaths.batchPdfName,
+              startedAt: now().toISOString(),
+            }),
+          );
+        }
+        if (activeAccountId !== account.id) {
+          try {
+            await portal.activateAccount(account);
+          } catch (firstError) {
+            options.logger.warn(
+              `[portal=${options.portalName} account=${account.id}] partner readiness attempt 1 failed: ${errorMessage(firstError)}. Reloading once before retry.`,
+            );
+            // Controlled recovery only: the adapter has already confirmed the
+            // selector before it fails readiness, so reload the billing route
+            // and retry the same requested partner once.
+            await portal.navigateToBills();
+            await portal.activateAccount(account);
+          }
+          activeAccountId = account.id;
+        }
+        const result = await processAccount(
+          portal,
+          account,
+          options,
+          now,
+          uniqueBills,
+          billSourcePartners,
+        );
+        record.status = 'completed';
+        record.totalMatchingBills = result.totalMatchingBills;
+        record.totalBatches = result.totalBatches;
+        record.manifestPath = result.manifestPath;
+        record.combinedPdfPath = result.combinedPdfPath;
+      } catch (error) {
+        record.status = 'failed';
+        record.failureMessage = redactSensitiveText(errorMessage(error), []);
+        if (record.manifestPath !== null) {
+          await markAccountManifestFailed(record.manifestPath, record.failureMessage).catch((manifestError: unknown) => {
+            options.logger.warn(
+              `[portal=${options.portalName} account=${account.id}] manifest failure checkpoint: ${errorMessage(manifestError)}`,
+            );
+          });
+        }
+        options.logger.error(`[portal=${options.portalName} account=${account.id}] ${record.failureMessage}`);
+        await portal.clearSelections().catch((clearError: unknown) => {
+          options.logger.warn(`[portal=${options.portalName} account=${account.id}] cleanup: ${errorMessage(clearError)}`);
+        });
+      }
+      await writeJsonAtomically(runPaths.runSummaryPath, summary);
+    }
+
+    summary.completedAt = now().toISOString();
+    const finalBatches = batchBills([...uniqueBills.values()]);
+    const completedPdfPaths = summary.accounts
+      .map((account) => account.combinedPdfPath)
+      .filter((path): path is string => path !== null);
+    const finalMergedPdfPath =
+      completedPdfPaths.length === 0 ? null : runPaths.finalCombinedPdfPath;
+    if (finalMergedPdfPath !== null) {
+      await mergePdfs(completedPdfPaths, finalMergedPdfPath);
+      await assertValidPdf(finalMergedPdfPath);
+    }
+    summary.totalUniqueMatchingBills = uniqueBills.size;
+    summary.finalMergedPdfPath = finalMergedPdfPath === null ? null : runPaths.finalCombinedPdfName;
+    const finalManifest: FinalRunManifest = {
+      portal: options.portalName,
+      requestedStartDate: options.startDateText,
+      requestedEndDate: options.endDateText,
+      totalUniqueMatchingBills: uniqueBills.size,
+      totalBatches: finalBatches.length,
+      finalMergedPdfPath: summary.finalMergedPdfPath ?? null,
+      bills: [...uniqueBills.values()].map((bill) => ({
+        ...bill,
+        sourcePartnerIds: [...(billSourcePartners.get(bill.uniqueKey) ?? [])],
+      })),
+      accounts: summary.accounts,
+    };
+    await writeJsonAtomically(runPaths.finalManifestPath, finalManifest);
+    await writeJsonAtomically(runPaths.runSummaryPath, summary);
+    const hadFailures = summary.accounts.some((account) => account.status === 'failed');
+    const totalMatchingBills = uniqueBills.size;
+    const totalBatches = finalBatches.length;
+    options.logger.info(`Completed ${summary.accounts.length - summary.accounts.filter((account) => account.status === 'completed').length} failed account(s); summary: ${runPaths.runSummaryPath}`);
+    return { totalMatchingBills, totalBatches, runSummaryPath: runPaths.runSummaryPath, accounts: summary.accounts, hadFailures };
   } catch (error) {
-    throw contextualError(
+    failed = true;
+    const wrapped = contextualError(
       'run portal',
       errorMessage(error),
       { portal: options.portalName },
       error,
     );
+    // Attach the live browser so the caller can keep it open for inspection
+    // and close it only after the user is done.
+    (wrapped as Error & { browser?: Browser | undefined; context?: BrowserContext | undefined }).browser =
+      browser;
+    (wrapped as Error & { browser?: Browser | undefined; context?: BrowserContext | undefined }).context =
+      context;
+    throw wrapped;
   } finally {
-    if (context) {
-      await context.close().catch((error: unknown) => {
-        options.logger.warn(
-          `[portal=${options.portalName}] close browser context: ${errorMessage(error)}.`,
+    if (!failed) {
+      // Keep headed runs open so the user can inspect the final billing page
+      // and manually close the browser when finished.
+      if (!options.headless && process.stdin.isTTY && browser) {
+        options.logger.info(
+          'Run complete. Close the browser window, or press Enter here, to exit.',
         );
-      });
-    }
-    if (browser) {
-      await browser.close().catch((error: unknown) => {
-        options.logger.warn(
-          `[portal=${options.portalName}] close browser: ${errorMessage(error)}.`,
-        );
-      });
+        await waitForBrowserClose(browser);
+      }
+      if (context) {
+        await context.close().catch((error: unknown) => {
+          options.logger.warn(
+            `[portal=${options.portalName}] close browser context: ${errorMessage(error)}.`,
+          );
+        });
+      }
+      if (browser) {
+        await browser.close().catch((error: unknown) => {
+          options.logger.warn(
+            `[portal=${options.portalName}] close browser: ${errorMessage(error)}.`,
+          );
+        });
+      }
     }
   }
 }
 
-function validateAndDeduplicateBills(bills: readonly Bill[], portalName: string): Bill[] {
+async function waitForBrowserClose(browser: Browser): Promise<void> {
+  if (!browser.isConnected()) return;
+
+  await new Promise<void>((resolve) => {
+    const onInput = (): void => finish();
+    const onDisconnected = (): void => finish();
+    const finish = (): void => {
+      browser.off('disconnected', onDisconnected);
+      process.stdin.off('data', onInput);
+      process.stdin.pause();
+      resolve();
+    };
+
+    browser.once('disconnected', onDisconnected);
+    process.stdin.resume();
+    process.stdin.once('data', onInput);
+  });
+}
+
+interface AccountProcessResult {
+  totalMatchingBills: number;
+  totalBatches: number;
+  manifestPath: string;
+  combinedPdfPath: string | null;
+  matchingBills: Bill[];
+}
+
+async function processAccount(
+  portal: BillingPortal,
+  account: PortalAccount,
+  options: RunPortalOptions,
+  now: () => Date,
+  uniqueBills: Map<string, Bill>,
+  billSourcePartners: Map<string, Set<string>>,
+): Promise<AccountProcessResult> {
+  const paths = createAccountOutputPaths(
+    options.outputRoot,
+    options.portalName,
+    options.startDateText,
+    options.endDateText,
+    account.id,
+  );
+  await ensureDirectory(paths.runDirectory);
+  const scannedBills = await portal.scanBills(options.startDate, options.endDate);
+  const scannedMatchingBills = validateAndDeduplicateBills(
+    scannedBills,
+    options.portalName,
+    options.startDate,
+    options.endDate,
+  );
+  const matchingBills: Bill[] = [];
+  for (const bill of scannedMatchingBills) {
+    const sources = billSourcePartners.get(bill.uniqueKey) ?? new Set<string>();
+    sources.add(account.id);
+    billSourcePartners.set(bill.uniqueKey, sources);
+    if (uniqueBills.has(bill.uniqueKey)) {
+      options.logger.info(
+        `[portal=${options.portalName} account=${account.id}] Duplicate bill retained from another partner: ${bill.uniqueKey}.`,
+      );
+      continue;
+    }
+    uniqueBills.set(bill.uniqueKey, bill);
+    matchingBills.push(bill);
+  }
+  options.logger.info(
+    `[portal=${options.portalName} account=${account.id}] Found ${scannedMatchingBills.length} matching bill(s); ${matchingBills.length} unique bill(s) will download.`,
+  );
+  const batches = batchBills(matchingBills);
+  const previousManifest = await readManifest(paths.manifestPath);
+  const compatiblePrevious =
+    previousManifest &&
+    isManifestForRun(
+      previousManifest,
+      options.portalName,
+      options.startDateText,
+      options.endDateText,
+      account.id,
+    )
+      ? previousManifest
+      : null;
+  const manifest = createManifest({
+    portal: options.portalName,
+    account,
+    requestedStartDate: options.startDateText,
+    requestedEndDate: options.endDateText,
+    batches,
+    batchPdfName: paths.batchPdfName,
+    startedAt: compatiblePrevious?.downloadStartTimestamp ?? now().toISOString(),
+  });
+  if (compatiblePrevious) {
+    manifest.batches = compatiblePrevious.batches.filter((record) => {
+      const expectedBatch = batches[record.batchNumber - 1];
+      return (
+        expectedBatch !== undefined &&
+        record.numberOfBills === expectedBatch.length &&
+        record.batchPdfPath === paths.batchPdfName(record.batchNumber) &&
+        record.includedBillUniqueKeys.join('\n') === expectedBatch.map((bill) => bill.uniqueKey).join('\n')
+      );
+    });
+  }
+  await writeManifest(paths.manifestPath, manifest);
+
+  if (matchingBills.length === 0) {
+    manifest.accountStatus = 'completed';
+    manifest.downloadCompletionTimestamp = now().toISOString();
+    await writeManifest(paths.manifestPath, manifest);
+    return {
+      totalMatchingBills: 0,
+      totalBatches: 0,
+      manifestPath: paths.manifestPath,
+      combinedPdfPath: null,
+      matchingBills,
+    };
+  }
+
+  for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+    const batch = batches[batchIndex];
+    if (!batch) throw new Error(`Internal error: batch ${batchIndex + 1} is missing.`);
+    const batchNumber = batchIndex + 1;
+    const batchPath = paths.batchPdfPath(batchNumber);
+    const batchName = paths.batchPdfName(batchNumber);
+    const expectedKeys = batch.map((bill) => bill.uniqueKey);
+    const previousRecord = findReusableBatchRecord(compatiblePrevious, batchNumber, expectedKeys, batchName);
+    const existingValidation = previousRecord ? await validatePdf(batchPath) : null;
+    let record: BatchManifestRecord;
+    if (previousRecord && existingValidation?.valid) {
+      record = { ...previousRecord, validationResult: existingValidation };
+      options.logger.info(`[portal=${options.portalName} account=${account.id}] Reused validated ${batchName}.`);
+    } else {
+      record = await retry(
+        async () => {
+          options.logger.info(
+            `[portal=${options.portalName} account=${account.id} batch=${batchNumber}] Batch start: expectedBillCount=${batch.length}; expectedKeys=${expectedKeys.join(',')}.`,
+          );
+          await portal.clearSelections();
+          await portal.verifySelectionCount(0);
+          await portal.selectBatch(batch, options.startDate, options.endDate);
+          await portal.verifySelectionCount(batch.length);
+          options.logger.info(
+            `[portal=${options.portalName} account=${account.id} batch=${batchNumber}] Bulk download start.`,
+          );
+          const downloadedPath = await portal.downloadSelectedBatch(
+            batchNumber,
+            batchPath,
+            batch.length,
+            options.startDate,
+            options.endDate,
+          );
+          if (downloadedPath !== batchPath) {
+            throw contextualError('download batch', 'Portal adapter saved the PDF to an unexpected path.', {
+              portal: options.portalName,
+              account: account.id,
+              batch: batchNumber,
+            });
+          }
+          const validationResult = await assertValidPdf(batchPath);
+          options.logger.info(
+            `[portal=${options.portalName} account=${account.id} batch=${batchNumber}] Bulk download complete: pdf=${batchPath}; valid=${validationResult.valid}; ${validationResult.message}`,
+          );
+          return {
+            batchNumber,
+            numberOfBills: batch.length,
+            batchPdfPath: batchName,
+            downloadTimestamp: now().toISOString(),
+            validationResult,
+            includedBillUniqueKeys: expectedKeys,
+          };
+        },
+        {
+          // A Duke bulk-download failure must reselect the whole batch once;
+          // retry() re-enters the operation above, which clears and returns to
+          // page 1 through selectBatch before it clicks Download View again.
+          delaysMs: [BATCH_RETRY_DELAYS_MS[0]],
+          onRetry: ({ nextAttempt, delayMs, error }) => {
+            options.logger.warn(
+              `[portal=${options.portalName} account=${account.id} batch=${batchNumber}] ${errorMessage(error)}. Retrying attempt ${nextAttempt} after ${delayMs / 1_000}s.`,
+            );
+          },
+        },
+      ).catch(async (error: unknown) => {
+        const fileValidation = await validatePdf(batchPath);
+        upsertBatchRecord(manifest, {
+          batchNumber,
+          numberOfBills: batch.length,
+          batchPdfPath: batchName,
+          downloadTimestamp: now().toISOString(),
+          validationResult: {
+            valid: false,
+            sizeBytes: fileValidation.sizeBytes,
+            message: fileValidation.valid
+              ? 'Batch processing failed before a successful checkpoint was recorded.'
+              : fileValidation.message,
+          },
+          includedBillUniqueKeys: expectedKeys,
+        });
+        await writeManifest(paths.manifestPath, manifest);
+        throw contextualError('process batch', errorMessage(error), {
+          portal: options.portalName,
+          account: account.id,
+          batch: batchNumber,
+        }, error);
+      });
+    }
+    upsertBatchRecord(manifest, record);
+    await writeManifest(paths.manifestPath, manifest);
+    await portal.clearSelections();
+    await portal.verifySelectionCount(0);
+    options.logger.info(
+      `[portal=${options.portalName} account=${account.id} batch=${batchNumber}] Cleanup complete; selected-count=0.`,
+    );
+  }
+
+  const orderedBatchPaths = batches.map((_, index) => paths.batchPdfPath(index + 1));
+  await mergePdfs(orderedBatchPaths, paths.combinedPdfPath);
+  await assertValidPdf(paths.combinedPdfPath);
+  manifest.finalMergedPdfPath = paths.combinedPdfName;
+  manifest.accountStatus = 'completed';
+  manifest.downloadCompletionTimestamp = now().toISOString();
+  await writeManifest(paths.manifestPath, manifest);
+  return {
+    totalMatchingBills: matchingBills.length,
+    totalBatches: batches.length,
+    manifestPath: paths.manifestPath,
+    combinedPdfPath: paths.combinedPdfPath,
+    matchingBills,
+  };
+}
+
+async function markAccountManifestFailed(manifestPath: string, failureMessage: string): Promise<void> {
+  const manifest = await readManifest(manifestPath);
+  if (manifest === null) return;
+  manifest.accountStatus = 'failed';
+  manifest.failureMessage = failureMessage;
+  await writeManifest(manifestPath, manifest);
+}
+
+function validateAndDeduplicateBills(
+  bills: readonly Bill[],
+  portalName: string,
+  requestedStart: Date,
+  requestedEnd: Date,
+): Bill[] {
+  const matchingBills: Bill[] = [];
   for (const bill of bills) {
     if (bill.portal !== portalName) {
       throw contextualError(
@@ -326,8 +569,18 @@ function validateAndDeduplicateBills(bills: readonly Bill[], portalName: string)
         },
       );
     }
+    if (
+      !isBillingCycleStartInRange(
+        cycleStart,
+        requestedStart,
+        requestedEnd,
+      )
+    ) {
+      continue;
+    }
+    matchingBills.push(bill);
   }
-  return deduplicateBills(bills).sort((left, right) =>
+  return deduplicateBills(matchingBills).sort((left, right) =>
     left.uniqueKey.localeCompare(right.uniqueKey, 'en'),
   );
 }

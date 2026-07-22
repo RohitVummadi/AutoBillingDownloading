@@ -6,6 +6,7 @@ import type {
   BillManifestRecord,
   Manifest,
 } from '../types/Manifest.js';
+import type { PortalAccount } from '../types/PortalAccount.js';
 import { writeJsonAtomically } from '../utils/files.js';
 
 export interface ManifestInput {
@@ -15,6 +16,7 @@ export interface ManifestInput {
   batches: readonly (readonly Bill[])[];
   batchPdfName(batchNumber: number): string;
   startedAt: string;
+  account?: PortalAccount;
 }
 
 export function createManifest(input: ManifestInput): Manifest {
@@ -29,6 +31,8 @@ export function createManifest(input: ManifestInput): Manifest {
 
   return {
     portal: input.portal,
+    ...(input.account ? { account: input.account } : {}),
+    ...(input.account ? { accountStatus: 'pending' as const } : {}),
     requestedStartDate: input.requestedStartDate,
     requestedEndDate: input.requestedEndDate,
     totalMatchingBills: billRecords.length,
@@ -75,11 +79,13 @@ export function isManifestForRun(
   portal: string,
   startDate: string,
   endDate: string,
+  accountId?: string,
 ): boolean {
   return (
     manifest.portal === portal &&
     manifest.requestedStartDate === startDate &&
-    manifest.requestedEndDate === endDate
+    manifest.requestedEndDate === endDate &&
+    (accountId === undefined || manifest.account?.id === accountId)
   );
 }
 
@@ -109,6 +115,12 @@ function isManifest(value: unknown): value is Manifest {
   const candidate = value as Partial<Manifest>;
   return (
     typeof candidate.portal === 'string' &&
+    (candidate.account === undefined || isPortalAccount(candidate.account)) &&
+    (candidate.accountStatus === undefined ||
+      candidate.accountStatus === 'pending' ||
+      candidate.accountStatus === 'completed' ||
+      candidate.accountStatus === 'failed') &&
+    (candidate.failureMessage === undefined || typeof candidate.failureMessage === 'string') &&
     typeof candidate.requestedStartDate === 'string' &&
     typeof candidate.requestedEndDate === 'string' &&
     typeof candidate.totalMatchingBills === 'number' &&
@@ -122,6 +134,17 @@ function isManifest(value: unknown): value is Manifest {
     candidate.batches.every(isBatchManifestRecord) &&
     Array.isArray(candidate.bills) &&
     candidate.bills.every(isBillManifestRecord)
+  );
+}
+
+function isPortalAccount(value: unknown): value is PortalAccount {
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as Partial<PortalAccount>;
+  return (
+    typeof candidate.id === 'string' &&
+    /^[A-Za-z0-9_-]+$/u.test(candidate.id) &&
+    typeof candidate.label === 'string' &&
+    typeof candidate.isCurrent === 'boolean'
   );
 }
 

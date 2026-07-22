@@ -5,6 +5,8 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  createAccountOutputPaths,
+  createRunOutputPaths,
   safeChildPath,
   writeJsonAtomically,
 } from '../src/utils/files.js';
@@ -36,5 +38,21 @@ describe('safe and atomic output files', () => {
     expect(() => safeChildPath('downloads', '..', 'bill.pdf')).toThrow(/Unsafe/u);
     expect(() => safeChildPath('downloads', 'nested/bill.pdf')).toThrow(/Unsafe/u);
     expect(() => safeChildPath('downloads', path.resolve('bill.pdf'))).toThrow(/Unsafe/u);
+  });
+
+  it('creates isolated safe output locations for each account and run summary', () => {
+    const run = createRunOutputPaths('./downloads', 'duke', '2026-06-01', '2026-07-12');
+    const account = createAccountOutputPaths(
+      './downloads',
+      'duke',
+      '2026-06-01',
+      '2026-07-12',
+      '1102669801',
+    );
+    expect(run.runSummaryPath).toMatch(/duke[\\/]2026-06-01-to-2026-07-12[\\/]run-summary\.json$/u);
+    expect(account.runDirectory).toMatch(/accounts[\\/]account-1102669801$/u);
+    expect(() =>
+      createAccountOutputPaths('./downloads', 'duke', '2026-06-01', '2026-07-12', '../bad'),
+    ).toThrow(/Unsafe account id/u);
   });
 });

@@ -4,29 +4,38 @@ export interface DukeCredentials {
 }
 
 export interface DukeConfig {
+  homeUrl: string;
   loginUrl: string;
-  billsUrl: string;
+  businessBillsUrl: string;
   navigationTimeoutMs: number;
+  postNavigationWaitMs: number;
   actionTimeoutMs: number;
   downloadTimeoutMs: number;
   maximumTablePages: number;
+  /** Directory for per-bill staging PDFs before they are merged into a batch. */
+  tempDirectory: string;
 }
 
 // LIVE-SITE VERIFICATION REQUIRED: Duke routes can vary by operating company and
 // account type. These defaults are deliberately isolated here and can be
 // overridden without changing application code.
 export const DUKE_DEFAULT_LOGIN_URL = 'https://my.duke-energy.com/login';
-export const DUKE_DEFAULT_BILLS_URL =
-  'https://my.duke-energy.com/my-account/billing-payments/billing-history';
+export const DUKE_DEFAULT_HOME_URL = 'https://www.duke-energy.com/home';
+export const DUKE_DEFAULT_BUSINESS_BILLS_URL =
+  'https://businessportal2.duke-energy.com/billinghistory';
 
 export function getDukeConfig(environment: NodeJS.ProcessEnv = process.env): DukeConfig {
   return {
+    homeUrl: environment.DUKE_HOME_URL?.trim() || DUKE_DEFAULT_HOME_URL,
     loginUrl: environment.DUKE_LOGIN_URL?.trim() || DUKE_DEFAULT_LOGIN_URL,
-    billsUrl: environment.DUKE_BILLS_URL?.trim() || DUKE_DEFAULT_BILLS_URL,
+    businessBillsUrl:
+      environment.DUKE_BUSINESS_BILLS_URL?.trim() || DUKE_DEFAULT_BUSINESS_BILLS_URL,
     navigationTimeoutMs: 45_000,
+    postNavigationWaitMs: 10_000,
     actionTimeoutMs: 20_000,
     downloadTimeoutMs: 90_000,
     maximumTablePages: 500,
+    tempDirectory: environment.DUKE_TEMP_DIRECTORY?.trim() || 'downloads/duke/.staging',
   };
 }
 

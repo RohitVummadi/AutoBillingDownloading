@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  DUKE_DEFAULT_BILLS_URL,
+  DUKE_DEFAULT_BUSINESS_BILLS_URL,
+  DUKE_DEFAULT_HOME_URL,
   DUKE_DEFAULT_LOGIN_URL,
   getDukeConfig,
   getDukeCredentials,
@@ -22,17 +23,22 @@ describe('Duke environment configuration', () => {
 
   it('uses marked defaults and supports live-site URL overrides', () => {
     expect(getDukeConfig({})).toMatchObject({
+      homeUrl: DUKE_DEFAULT_HOME_URL,
       loginUrl: DUKE_DEFAULT_LOGIN_URL,
-      billsUrl: DUKE_DEFAULT_BILLS_URL,
+      businessBillsUrl: DUKE_DEFAULT_BUSINESS_BILLS_URL,
+      postNavigationWaitMs: 10_000,
+      maximumTablePages: 500,
     });
     expect(
       getDukeConfig({
+        DUKE_HOME_URL: 'https://verified.duke.invalid/home',
         DUKE_LOGIN_URL: 'https://verified.duke.invalid/login',
-        DUKE_BILLS_URL: 'https://verified.duke.invalid/bills',
+        DUKE_BUSINESS_BILLS_URL: 'https://verified.duke.invalid/billinghistory',
       }),
     ).toMatchObject({
+      homeUrl: 'https://verified.duke.invalid/home',
       loginUrl: 'https://verified.duke.invalid/login',
-      billsUrl: 'https://verified.duke.invalid/bills',
+      businessBillsUrl: 'https://verified.duke.invalid/billinghistory',
     });
   });
 });

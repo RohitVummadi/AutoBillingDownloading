@@ -11,6 +11,15 @@ export interface OutputPaths {
   batchPdfName(batchNumber: number): string;
 }
 
+export interface RunOutputPaths {
+  outputRoot: string;
+  runDirectory: string;
+  runSummaryPath: string;
+  finalManifestPath: string;
+  finalCombinedPdfPath: string;
+  finalCombinedPdfName: string;
+}
+
 export function createOutputPaths(
   outputRoot: string,
   portal: string,
@@ -31,6 +40,54 @@ export function createOutputPaths(
 
   return {
     outputRoot: resolvedRoot,
+    runDirectory,
+    manifestPath: safeChildPath(runDirectory, 'manifest.json'),
+    combinedPdfPath: safeChildPath(runDirectory, combinedPdfName),
+    combinedPdfName,
+    batchPdfPath(batchNumber: number): string {
+      return safeChildPath(runDirectory, formatBatchFileName(batchNumber));
+    },
+    batchPdfName(batchNumber: number): string {
+      return formatBatchFileName(batchNumber);
+    },
+  };
+}
+
+export function createRunOutputPaths(
+  outputRoot: string,
+  portal: string,
+  startDate: string,
+  endDate: string,
+): RunOutputPaths {
+  assertSafeSegment(portal, 'portal');
+  assertSafeSegment(startDate, 'start date');
+  assertSafeSegment(endDate, 'end date');
+  const resolvedRoot = path.resolve(outputRoot);
+  const runDirectory = safeChildPath(resolvedRoot, portal, `${startDate}-to-${endDate}`);
+  const finalCombinedPdfName = `combined-bills-${startDate}-to-${endDate}.pdf`;
+  return {
+    outputRoot: resolvedRoot,
+    runDirectory,
+    runSummaryPath: safeChildPath(runDirectory, 'run-summary.json'),
+    finalManifestPath: safeChildPath(runDirectory, 'manifest.json'),
+    finalCombinedPdfPath: safeChildPath(runDirectory, finalCombinedPdfName),
+    finalCombinedPdfName,
+  };
+}
+
+export function createAccountOutputPaths(
+  outputRoot: string,
+  portal: string,
+  startDate: string,
+  endDate: string,
+  accountId: string,
+): OutputPaths {
+  assertSafeSegment(accountId, 'account id');
+  const root = createRunOutputPaths(outputRoot, portal, startDate, endDate);
+  const runDirectory = safeChildPath(root.runDirectory, 'accounts', `account-${accountId}`);
+  const combinedPdfName = `combined-bills-${startDate}-to-${endDate}.pdf`;
+  return {
+    outputRoot: root.outputRoot,
     runDirectory,
     manifestPath: safeChildPath(runDirectory, 'manifest.json'),
     combinedPdfPath: safeChildPath(runDirectory, combinedPdfName),
